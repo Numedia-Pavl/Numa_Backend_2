@@ -18,15 +18,9 @@ const app  = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({
-  origin: [
-    process.env.FRONTEND_URL || '*',
-    'http://localhost:5500',
-    'http://127.0.0.1:5500',
-    'http://localhost:3000'
-  ],
-  credentials: true
-}));
+
+// Allow ALL origins — fixes "Failed to fetch"
+app.use(cors({ origin: '*', credentials: false }));
 
 const limiter     = rateLimit({ windowMs: 15 * 60 * 1000, max: 300 });
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20,
