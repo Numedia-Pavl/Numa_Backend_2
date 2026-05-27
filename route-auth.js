@@ -14,7 +14,7 @@ router.post('/login', async (req, res) => {
   try {
     const { data: user, error } = await supabase
       .from('users')
-      .select('id, email, password_hash, full_name, roles, employee_id, is_active')
+      .select('id, email, password_hash, full_name, roles, employee_id, company_id, is_active')
       .eq('email', email.toLowerCase().trim())
       .single();
 
@@ -27,19 +27,39 @@ router.post('/login', async (req, res) => {
     if (!valid)
       return res.status(401).json({ success: false, message: 'Invalid email or password' });
 
+    // ── company_id is now in the JWT ────────────────────────
     const token = jwt.sign(
-      { id: user.id, email: user.email, roles: user.roles, employee_id: user.employee_id },
+      {
+        id:          user.id,
+        email:       user.email,
+        roles:       user.roles,
+        employee_id: user.employee_id,
+        company_id:  user.company_id,   // ← KEY ADDITION
+      },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
     );
 
+    // Get company info so frontend can display company name
+    const { data: company } = await supabase.from('companies')
+      .select('id, name, slug, plan, logo_url').eq('id', user.company_id).single();
+
     await supabase.from('activity_logs').insert({
-      user_id: user.id, action: 'LOGIN', description: 'User logged in'
+      user_id: user.id, company_id: user.company_id,
+      action: 'LOGIN', description: 'User logged in'
     });
 
     res.json({
       success: true, token,
-      user: { id: user.id, email: user.email, full_name: user.full_name, roles: user.roles, employee_id: user.employee_id }
+      user: {
+        id:          user.id,
+        email:       user.email,
+        full_name:   user.full_name,
+        roles:       user.roles,
+        employee_id: user.employee_id,
+        company_id:  user.company_id,
+      },
+      company,
     });
   } catch (err) {
     console.error('[Auth/login]', err);
@@ -51,7 +71,7 @@ router.get('/me', authenticate, async (req, res) => {
   try {
     const { data: user, error } = await supabase
       .from('users')
-      .select('id, email, full_name, roles, employee_id, is_active')
+      .select('id, email, full_name, roles, employee_id, company_id, is_active')
       .eq('id', req.user.id)
       .single();
     if (error || !user) return res.status(404).json({ success: false, message: 'User not found' });
