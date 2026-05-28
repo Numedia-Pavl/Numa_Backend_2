@@ -30,18 +30,19 @@ router.post('/login', async (req, res) => {
     // ── Auto-resolve employee_id if not set on user account ──
     let employeeId = user.employee_id;
     if (!employeeId && user.company_id) {
-      const { data: empMatch } = await supabase.from('employees')
-        .select('id')
-        .eq('email', user.email)
-        .eq('company_id', user.company_id)
-        .single();
-      if (empMatch) {
-        employeeId = empMatch.id;
-        // Persist the link so future logins don't need the lookup
-        await supabase.from('users')
-          .update({ employee_id: employeeId })
-          .eq('id', user.id);
-      }
+      try {
+        const { data: empMatch } = await supabase.from('employees')
+          .select('id')
+          .eq('email', user.email)
+          .eq('company_id', user.company_id)
+          .single();
+        if (empMatch) {
+          employeeId = empMatch.id;
+          await supabase.from('users')
+            .update({ employee_id: employeeId })
+            .eq('id', user.id);
+        }
+      } catch(e) { /* non-critical — continue login */ }
     }
 
     const token = jwt.sign(
@@ -49,21 +50,30 @@ router.post('/login', async (req, res) => {
         id:          user.id,
         email:       user.email,
         roles:       user.roles,
-        employee_id: employeeId,
-        company_id:  user.company_id,
+        employee_id: employeeId || null,
+        company_id:  user.company_id || null,
       },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
     );
 
-    // Get company info so frontend can display company name
-    const { data: company } = await supabase.from('companies')
-      .select('id, name, slug, plan, logo_url').eq('id', user.company_id).single();
+    // Get company info — optional, don't crash if missing
+    let company = null;
+    if (user.company_id) {
+      try {
+        const { data: co } = await supabase.from('companies')
+          .select('id, name, slug, plan, logo_url').eq('id', user.company_id).single();
+        company = co;
+      } catch(e) {}
+    }
 
-    await supabase.from('activity_logs').insert({
-      user_id: user.id, company_id: user.company_id,
-      action: 'LOGIN', description: 'User logged in'
-    }).catch(() => {});  // non-critical, don't fail login if logs fail
+    // Log activity — non-critical
+    try {
+      await supabase.from('activity_logs').insert({
+        user_id: user.id, company_id: user.company_id,
+        action: 'LOGIN', description: 'User logged in'
+      });
+    } catch(e) {}
 
     res.json({
       success: true, token,
@@ -72,8 +82,8 @@ router.post('/login', async (req, res) => {
         email:       user.email,
         full_name:   user.full_name,
         roles:       user.roles,
-        employee_id: employeeId,
-        company_id:  user.company_id,
+        employee_id: employeeId || null,
+        company_id:  user.company_id || null,
       },
       company,
     });
