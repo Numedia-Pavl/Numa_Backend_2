@@ -27,14 +27,30 @@ router.post('/login', async (req, res) => {
     if (!valid)
       return res.status(401).json({ success: false, message: 'Invalid email or password' });
 
-    // ── company_id is now in the JWT ────────────────────────
+    // ── Auto-resolve employee_id if not set on user account ──
+    let employeeId = user.employee_id;
+    if (!employeeId && user.company_id) {
+      const { data: empMatch } = await supabase.from('employees')
+        .select('id')
+        .eq('email', user.email)
+        .eq('company_id', user.company_id)
+        .single();
+      if (empMatch) {
+        employeeId = empMatch.id;
+        // Persist the link so future logins don't need the lookup
+        await supabase.from('users')
+          .update({ employee_id: employeeId })
+          .eq('id', user.id);
+      }
+    }
+
     const token = jwt.sign(
       {
         id:          user.id,
         email:       user.email,
         roles:       user.roles,
-        employee_id: user.employee_id,
-        company_id:  user.company_id,   // ← KEY ADDITION
+        employee_id: employeeId,
+        company_id:  user.company_id,
       },
       process.env.JWT_SECRET,
       { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
@@ -47,7 +63,7 @@ router.post('/login', async (req, res) => {
     await supabase.from('activity_logs').insert({
       user_id: user.id, company_id: user.company_id,
       action: 'LOGIN', description: 'User logged in'
-    });
+    }).catch(() => {});  // non-critical, don't fail login if logs fail
 
     res.json({
       success: true, token,
@@ -56,7 +72,7 @@ router.post('/login', async (req, res) => {
         email:       user.email,
         full_name:   user.full_name,
         roles:       user.roles,
-        employee_id: user.employee_id,
+        employee_id: employeeId,
         company_id:  user.company_id,
       },
       company,
