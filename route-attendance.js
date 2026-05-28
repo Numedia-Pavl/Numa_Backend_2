@@ -61,16 +61,10 @@ router.get('/', authenticate, async (req, res) => {
 // GET /api/attendance/today
 router.get('/today', authenticate, async (req, res) => {
   try {
-    let empId = req.user.employee_id;
-    if (!empId) {
-      const { data: empByEmail } = await supabase.from('employees')
-        .select('id').eq('email', req.user.email).eq('company_id', req.user.company_id).single();
-      empId = empByEmail?.id || null;
-    }
-    if (!empId) return res.json({ success:true, record:null, date:phDate(), server_time:phTimeStr() });
+    if (!req.user.employee_id) return res.json({ success:true, record:null, date:phDate(), server_time:phTimeStr() });
     const { data } = await supabase.from('attendance')
       .select('*')
-      .eq('employee_id', empId)
+      .eq('employee_id', req.user.employee_id)
       .eq('company_id',  req.user.company_id)
       .eq('date', phDate())
       .single();
@@ -105,15 +99,9 @@ router.post('/clock-in', authenticate, async (req, res) => {
   const cid   = req.user.company_id;
   const { latitude, longitude, notes } = req.body;
   try {
-    // Resolve employee_id — look up by email if not in JWT
-    let empId = req.user.employee_id;
-    if (!empId) {
-      const { data: empByEmail } = await supabase.from('employees')
-        .select('id').eq('email', req.user.email).eq('company_id', cid).single();
-      if (!empByEmail) return res.status(400).json({ success:false,
-        message: 'Your account is not linked to an employee record. Please ask HR to set up your employee profile.' });
-      empId = empByEmail.id;
-    }
+    const empId = req.user.employee_id;
+    if (!empId) return res.status(400).json({ success:false,
+      message: 'Your account is not linked to an employee record. Please contact HR.' });
 
     const { data: existing } = await supabase.from('attendance')
       .select('id,clock_in,clock_out')
@@ -153,13 +141,8 @@ router.put('/clock-out', authenticate, async (req, res) => {
   const now   = phTimeStr();
   const cid   = req.user.company_id;
   try {
-    let empId = req.user.employee_id;
-    if (!empId) {
-      const { data: empByEmail } = await supabase.from('employees')
-        .select('id').eq('email', req.user.email).eq('company_id', cid).single();
-      if (!empByEmail) return res.status(400).json({ success:false, message:'No employee record found for your account.' });
-      empId = empByEmail.id;
-    }
+    const empId = req.user.employee_id;
+    if (!empId) return res.status(400).json({ success:false, message:'Your account is not linked to an employee record.' });
     const { data: record } = await supabase.from('attendance')
       .select('*')
       .eq('employee_id', empId)
