@@ -49,7 +49,7 @@ router.post('/register', async (req, res) => {
     const { data, error } = await supabase.rpc('register_company', {
       p_company_name:        company_name,
       p_slug:                slug,
-      p_plan:                plan || 'business',
+      p_plan:                plan || 'starter',
       p_admin_name:          admin_name,
       p_admin_email:         admin_email.toLowerCase().trim(),
       p_admin_password_hash: password_hash,
