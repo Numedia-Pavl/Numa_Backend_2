@@ -1,128 +1,267 @@
-'use strict';
-const express  = require('express');
-const bcrypt   = require('bcryptjs');
-const jwt      = require('jsonwebtoken');
-const supabase = require('./db');
-const { authenticate } = require('./authMiddleware');
+require('dotenv').config();
+const express = require('express');
+const router  = express.Router();
+const bcrypt  = require('bcryptjs');
+const jwt     = require('jsonwebtoken');
+const { supabase } = require('./supabase');
+const auth    = require('./authMiddleware');
 
-const router = express.Router();
+const JWT_SECRET  = process.env.JWT_SECRET;
+const JWT_EXPIRES = '8h';
 
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/login
+// ─────────────────────────────────────────────────────────────
 router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password)
-    return res.status(400).json({ success: false, message: 'Email and password required' });
   try {
+    const { email, password } = req.body;
+
+    if (!email || !password)
+      return res.status(400).json({ error: 'Email and password are required.' });
+
     const { data: user, error } = await supabase
       .from('users')
-      .select('id, email, password_hash, full_name, roles, employee_id, company_id, is_active')
+      .select('*')
       .eq('email', email.toLowerCase().trim())
-      .single();
+      .maybeSingle();
 
     if (error || !user)
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
-    if (!user.is_active)
-      return res.status(403).json({ success: false, message: 'Account is deactivated. Contact HR.' });
+      return res.status(401).json({ error: 'Incorrect email or password.' });
+
+    if (user.employment_status === 'inactive')
+      return res.status(403).json({
+        error: 'Your account is deactivated. Contact your HR administrator.'
+      });
 
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid)
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
+      return res.status(401).json({ error: 'Incorrect email or password.' });
 
-    // ── Auto-resolve employee_id if not set on user account ──
-    let employeeId = user.employee_id;
-    if (!employeeId && user.company_id) {
-      try {
-        const { data: empMatch } = await supabase.from('employees')
-          .select('id')
-          .eq('email', user.email)
-          .eq('company_id', user.company_id)
-          .single();
-        if (empMatch) {
-          employeeId = empMatch.id;
-          await supabase.from('users')
-            .update({ employee_id: employeeId })
-            .eq('id', user.id);
-        }
-      } catch(e) { /* non-critical — continue login */ }
-    }
+    // Resolve linked employee record
+    const { data: emp } = await supabase
+      .from('employees')
+      .select('id, employee_id')
+      .eq('email', user.email)
+      .maybeSingle();
 
-    const token = jwt.sign(
-      {
-        id:          user.id,
-        email:       user.email,
-        roles:       user.roles,
-        employee_id: employeeId || null,
-        company_id:  user.company_id || null,
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
-    );
+    // Update last login (non-blocking)
+    supabase.from('users').update({ last_login: new Date() }).eq('id', user.id).then(() => {});
 
-    // Get company info — optional, don't crash if missing
-    let company = null;
-    if (user.company_id) {
-      try {
-        const { data: co } = await supabase.from('companies')
-          .select('id, name, slug, plan, logo_url').eq('id', user.company_id).single();
-        company = co;
-      } catch(e) {}
-    }
-
-    // Log activity — non-critical
-    try {
-      await supabase.from('activity_logs').insert({
-        user_id: user.id, company_id: user.company_id,
-        action: 'LOGIN', description: 'User logged in'
-      });
-    } catch(e) {}
+    const token = makeToken(user, emp?.id);
 
     res.json({
-      success: true, token,
-      user: {
-        id:          user.id,
-        email:       user.email,
-        full_name:   user.full_name,
-        roles:       user.roles,
-        employee_id: employeeId || null,
-        company_id:  user.company_id || null,
-      },
-      company,
+      token,
+      user: publicUser(user, emp)
     });
   } catch (err) {
-    console.error('[Auth/login]', err);
-    res.status(500).json({ success: false, message: 'Server error' });
+    console.error('Login error:', err.message);
+    res.status(500).json({ error: 'Login failed. Please try again.' });
   }
 });
 
-router.get('/me', authenticate, async (req, res) => {
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/register  — Self-service signup
+//
+// Flow:
+//  1. Validate input
+//  2. Create user account (roles: ['employee'] by default)
+//  3. If HR already imported an employee record with this email
+//     → link it (user_id + update status)
+//     Otherwise → create a new blank employee record
+//  4. Return JWT so user is logged in immediately
+// ─────────────────────────────────────────────────────────────
+router.post('/register', async (req, res) => {
   try {
-    const { data: user, error } = await supabase
+    const { first_name, last_name, email, password, confirm_password } = req.body;
+
+    // ── Validate ──────────────────────────────────────────────
+    const errs = [];
+    if (!first_name?.trim())  errs.push('First name is required.');
+    if (!last_name?.trim())   errs.push('Last name is required.');
+    if (!email?.trim())       errs.push('Email is required.');
+    else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) errs.push('Enter a valid email address.');
+    if (!password)            errs.push('Password is required.');
+    else if (password.length < 8) errs.push('Password must be at least 8 characters.');
+    if (confirm_password !== undefined && password !== confirm_password)
+      errs.push('Passwords do not match.');
+    if (errs.length) return res.status(400).json({ error: errs.join(' ') });
+
+    const cleanEmail = email.toLowerCase().trim();
+
+    // ── Check duplicate ──────────────────────────────────────
+    const { data: existing } = await supabase
+      .from('users').select('id').eq('email', cleanEmail).maybeSingle();
+
+    if (existing)
+      return res.status(409).json({
+        error: 'This email is already registered. Please sign in.',
+        redirect_to_login: true
+      });
+
+    // ── Create user ──────────────────────────────────────────
+    const password_hash = await bcrypt.hash(password, 10);
+
+    const { data: user, error: uErr } = await supabase
       .from('users')
-      .select('id, email, full_name, roles, employee_id, company_id, is_active')
+      .insert({
+        first_name       : first_name.trim(),
+        last_name        : last_name.trim(),
+        email            : cleanEmail,
+        password_hash,
+        roles            : ['employee'],
+        employment_type  : 'probationary',
+        employment_status: 'active',
+      })
+      .select()
+      .single();
+
+    if (uErr) throw uErr;
+
+    // ── Link or create employee record ────────────────────────
+    let empId = null;
+    let linked = false;
+
+    const { data: preloaded } = await supabase
+      .from('employees')
+      .select('id')
+      .eq('email', cleanEmail)
+      .maybeSingle();
+
+    if (preloaded) {
+      // HR pre-loaded this person via CSV → just link
+      await supabase
+        .from('employees')
+        .update({ user_id: user.id, employment_status: 'active' })
+        .eq('id', preloaded.id);
+      empId  = preloaded.id;
+      linked = true;
+    } else {
+      // Brand new person — create a basic employee record
+      const { count } = await supabase
+        .from('employees')
+        .select('*', { count: 'exact', head: true });
+
+      const year = new Date().getFullYear();
+      const empNumber = `EMP-${year}-${String((count || 0) + 1).padStart(3, '0')}`;
+
+      const { data: emp } = await supabase
+        .from('employees')
+        .insert({
+          employee_id      : empNumber,
+          first_name       : first_name.trim(),
+          last_name        : last_name.trim(),
+          email            : cleanEmail,
+          user_id          : user.id,
+          employment_type  : 'probationary',
+          employment_status: 'active',
+          basic_salary     : 0,  // HR fills in later
+        })
+        .select('id')
+        .single();
+      empId = emp?.id;
+    }
+
+    const token = makeToken(user, empId);
+
+    // ── Activity log ──────────────────────────────────────────
+    supabase.from('activity_logs').insert({
+      user_id   : user.id,
+      user_email: user.email,
+      action    : 'SELF_REGISTER',
+      details   : { linked_to_existing: linked, ip: req.ip }
+    }).then(() => {});
+
+    res.status(201).json({
+      message : `Welcome to NUMA HRIS, ${first_name}!`,
+      token,
+      user    : publicUser(user, { id: empId }),
+      linked,  // true = existing HR record found & linked
+    });
+
+  } catch (err) {
+    console.error('Register error:', err.message);
+    if (err.code === '23505')
+      return res.status(409).json({
+        error: 'This email is already registered. Please sign in.',
+        redirect_to_login: true
+      });
+    res.status(500).json({ error: 'Registration failed. Please try again.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/auth/me
+// ─────────────────────────────────────────────────────────────
+router.get('/me', auth.verify, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('id, email, first_name, last_name, roles, employment_status, last_login, created_at')
       .eq('id', req.user.id)
       .single();
-    if (error || !user) return res.status(404).json({ success: false, message: 'User not found' });
-    res.json({ success: true, user });
+
+    const { data: emp } = await supabase
+      .from('employees')
+      .select('id, employee_id, first_name, last_name, position, department, basic_salary, employment_type, date_hired, profile_photo')
+      .eq('email', user.email)
+      .maybeSingle();
+
+    res.json({ ...user, employee: emp || null });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/change-password', authenticate, async (req, res) => {
-  const { current_password, new_password } = req.body;
-  if (!current_password || !new_password)
-    return res.status(400).json({ success: false, message: 'Both passwords required' });
-  if (new_password.length < 8)
-    return res.status(400).json({ success: false, message: 'New password must be at least 8 characters' });
+// ─────────────────────────────────────────────────────────────
+// POST /api/auth/change-password
+// ─────────────────────────────────────────────────────────────
+router.post('/change-password', auth.verify, async (req, res) => {
   try {
-    const { data: user } = await supabase.from('users').select('password_hash').eq('id', req.user.id).single();
-    const valid = await bcrypt.compare(current_password, user.password_hash);
-    if (!valid) return res.status(401).json({ success: false, message: 'Current password is incorrect' });
-    const hash = await bcrypt.hash(new_password, 12);
-    await supabase.from('users').update({ password_hash: hash }).eq('id', req.user.id);
-    res.json({ success: true, message: 'Password changed successfully' });
+    const { current_password, new_password } = req.body;
+
+    if (!current_password || !new_password)
+      return res.status(400).json({ error: 'Both current and new password are required.' });
+    if (new_password.length < 8)
+      return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+
+    const { data: user } = await supabase
+      .from('users').select('password_hash').eq('id', req.user.id).single();
+
+    const ok = await bcrypt.compare(current_password, user.password_hash);
+    if (!ok)
+      return res.status(401).json({ error: 'Current password is incorrect.' });
+
+    await supabase
+      .from('users')
+      .update({ password_hash: await bcrypt.hash(new_password, 10) })
+      .eq('id', req.user.id);
+
+    res.json({ message: 'Password changed successfully.' });
   } catch (err) {
-    res.status(500).json({ success: false, message: 'Server error' });
+    res.status(500).json({ error: err.message });
   }
 });
+
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
+function makeToken(user, employeeId) {
+  return jwt.sign(
+    { id: user.id, email: user.email, roles: user.roles, employee_id: employeeId },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES }
+  );
+}
+
+function publicUser(user, emp) {
+  return {
+    id         : user.id,
+    email      : user.email,
+    first_name : user.first_name,
+    last_name  : user.last_name,
+    roles      : user.roles,
+    employee_id: emp?.id || null,
+  };
+}
 
 module.exports = router;
