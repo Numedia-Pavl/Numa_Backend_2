@@ -1,45 +1,101 @@
-'use strict';
 const jwt      = require('jsonwebtoken');
-const supabase = require('./db');
+const { supabase } = require('./supabase');
 
-function authenticate(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) {
-    return res.status(401).json({ success: false, message: 'No token provided' });
-  }
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('⚠️  JWT_SECRET is not set. Auth will not work.');
+}
+
+/**
+ * verify – validates the Bearer token and attaches req.user
+ */
+async function verify(req, res, next) {
   try {
-    const token = header.split(' ')[1];
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    const authHeader = req.headers['authorization'] || '';
+    const token      = authHeader.replace(/^Bearer\s+/i, '');
 
-    // ── Auto-resolve employee_id if missing from token ──────
-    // This covers tokens issued before the auto-link fix was deployed
-    if (!req.user.employee_id && req.user.company_id && req.user.email) {
-      supabase.from('employees')
-        .select('id')
-        .eq('email', req.user.email)
-        .eq('company_id', req.user.company_id)
-        .single()
-        .then(({ data }) => {
-          if (data) req.user.employee_id = data.id;
-          next();
-        })
-        .catch(() => next()); // don't block request if lookup fails
-    } else {
-      next();
+    if (!token) {
+      return res.status(401).json({ error: 'Not logged in. Please sign in to continue.' });
     }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (jwtErr) {
+      if (jwtErr.name === 'TokenExpiredError') {
+        return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
+      }
+      return res.status(401).json({ error: 'Invalid session. Please sign in again.' });
+    }
+
+    // Fetch fresh user record (picks up role changes)
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('id, email, roles, employment_status')
+      .eq('id', decoded.id)
+      .single();
+
+    if (error || !user) {
+      return res.status(401).json({ error: 'Account not found. Please contact your HR administrator.' });
+    }
+
+    if (user.employment_status === 'inactive') {
+      return res.status(403).json({ error: 'Your account has been deactivated. Please contact your HR administrator.' });
+    }
+
+    req.user = {
+      id    : user.id,
+      email : user.email,
+      roles : user.roles || [],
+    };
+
+    // Resolve employee_id from the employees table if not in token
+    if (!req.user.employee_id) {
+      const { data: emp } = await supabase
+        .from('employees')
+        .select('id')
+        .eq('email', user.email)
+        .single();
+      req.user.employee_id = emp?.id || null;
+    }
+
+    next();
   } catch (err) {
-    return res.status(401).json({ success: false, message: 'Token expired or invalid' });
+    console.error('authMiddleware error:', err.message);
+    res.status(500).json({ error: 'Authentication error. Please try again.' });
   }
 }
 
-function authorize(...roles) {
+/**
+ * requireRole(allowedRoles) – middleware factory
+ * Usage: router.get('/path', auth.verify, auth.requireRole(['admin','hr']), handler)
+ */
+function requireRole(allowedRoles) {
   return (req, res, next) => {
-    if (!req.user) return res.status(401).json({ success: false, message: 'Not authenticated' });
-    const userRoles = Array.isArray(req.user.roles) ? req.user.roles : [req.user.role];
-    const allowed   = roles.some(r => userRoles.includes(r));
-    if (!allowed) return res.status(403).json({ success: false, message: 'Access denied' });
+    if (!req.user) {
+      return res.status(401).json({ error: 'Not authenticated.' });
+    }
+    const userRoles = req.user.roles || [];
+    const hasRole   = allowedRoles.some(r => userRoles.includes(r));
+    if (!hasRole) {
+      return res.status(403).json({
+        error: `Access denied. You need one of these roles: ${allowedRoles.join(', ')}.`
+      });
+    }
     next();
   };
 }
 
-module.exports = { authenticate, authorize };
+/**
+ * hasRole(req, roles) – inline check inside a handler
+ */
+function hasRole(req, roles) {
+  const userRoles = req.user?.roles || [];
+  return roles.some(r => userRoles.includes(r));
+}
+
+const isAdmin   = (req) => hasRole(req, ['admin']);
+const isHR      = (req) => hasRole(req, ['admin','hr','hr_manager']);
+const isManager = (req) => hasRole(req, ['admin','hr','hr_manager','manager','supervisor','department_head']);
+
+module.exports = { verify, requireRole, hasRole, isAdmin, isHR, isManager };
